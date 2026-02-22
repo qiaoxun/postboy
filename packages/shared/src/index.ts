@@ -21,6 +21,11 @@ export interface RequestDefinition {
   };
 }
 
+export interface AuthConfig {
+  type: string;
+  params: Record<string, string>;
+}
+
 export interface ResponseSnapshot {
   status: number;
   statusText?: string;
@@ -64,6 +69,7 @@ export interface CollectionRequest {
   name: string;
   definition: RequestDefinition;
   variables?: Variable[];
+  auth?: AuthConfig;
 }
 
 export interface CollectionFolder {
@@ -71,6 +77,7 @@ export interface CollectionFolder {
   name: string;
   folders: CollectionFolder[];
   requests: CollectionRequest[];
+  auth?: AuthConfig;
 }
 
 export interface Collection {
@@ -79,6 +86,7 @@ export interface Collection {
   description?: string;
   folders: CollectionFolder[];
   requests: CollectionRequest[];
+  auth?: AuthConfig;
   createdAt: string;
   updatedAt: string;
 }
