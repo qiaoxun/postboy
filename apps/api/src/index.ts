@@ -10,6 +10,8 @@ import type {
   ResponseSnapshot,
   Variable,
 } from '@postboy/shared';
+import { exportPostmanCollection, importPostmanCollection } from './postman.js';
+import { historyToCsv, historyToJson, type RunHistoryEntry } from './runHistory.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_REDIRECTS = 5;
@@ -27,6 +29,7 @@ const __dirname = path.dirname(__filename);
 const dataDir = path.resolve(__dirname, '../data');
 const collectionsFile = path.join(dataDir, 'collections.json');
 const environmentsFile = path.join(dataDir, 'environments.json');
+const runHistoryFile = path.join(dataDir, 'run-history.json');
 
 const server = Fastify({ logger: true });
 
@@ -250,6 +253,33 @@ server.delete('/collections/:id', async (req, reply) => {
   }
   await writeJsonFile(collectionsFile, filtered);
   return reply.status(204).send();
+});
+
+server.post('/collections/import', async (req, reply) => {
+  const payload = req.body as { postmanJson?: string };
+  if (!payload?.postmanJson) {
+    return reply.status(400).send({ message: 'postmanJson is required.' });
+  }
+
+  try {
+    const imported = importPostmanCollection(payload.postmanJson);
+    const collections = await readJsonFile<Collection[]>(collectionsFile, []);
+    collections.push(imported);
+    await writeJsonFile(collectionsFile, collections);
+    return reply.status(201).send(imported);
+  } catch (error) {
+    return reply.status(400).send({ message: 'Invalid Postman collection JSON.', error });
+  }
+});
+
+server.get('/collections/:id/export', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const collections = await readJsonFile<Collection[]>(collectionsFile, []);
+  const collection = collections.find((entry) => entry.id === id);
+  if (!collection) {
+    return reply.status(404).send({ message: 'Collection not found.' });
+  }
+  return exportPostmanCollection(collection);
 });
 
 server.get('/environments', async () => readJsonFile<Environment[]>(environmentsFile, []));
@@ -492,6 +522,15 @@ server.post('/execute', async (req, reply) => {
       'Executed outbound request',
     );
 
+    const runHistory = await readJsonFile<RunHistoryEntry[]>(runHistoryFile, []);
+    runHistory.unshift({
+      id: crypto.randomUUID(),
+      executedAt: completedAtIso,
+      request: requestDefinition,
+      response: snapshot,
+    });
+    await writeJsonFile(runHistoryFile, runHistory.slice(0, 500));
+
     return snapshot;
   } catch (error) {
     req.log.error({ err: error }, 'Outbound request failed');
@@ -500,6 +539,19 @@ server.post('/execute', async (req, reply) => {
       error: error instanceof Error ? error.message : 'Unknown error',
     });
   }
+});
+
+server.get('/history/export', async (req, reply) => {
+  const { format = 'json' } = req.query as { format?: 'json' | 'csv' };
+  const runHistory = await readJsonFile<RunHistoryEntry[]>(runHistoryFile, []);
+
+  if (format === 'csv') {
+    reply.header('content-type', 'text/csv; charset=utf-8');
+    return historyToCsv(runHistory);
+  }
+
+  reply.header('content-type', 'application/json; charset=utf-8');
+  return historyToJson(runHistory);
 });
 
 const port = Number(process.env.PORT ?? 4000);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CSSProperties } from 'react';
 import type {
@@ -84,6 +84,7 @@ function emptyFolder(name = 'Folder'): CollectionFolder {
 }
 
 export default function HomePage() {
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const [collections, setCollections] = useState<Collection[]>([]);
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [globalVariables, setGlobalVariables] = useState<KeyValueRow[]>([
@@ -217,12 +218,62 @@ export default function HomePage() {
   const activeEnvironmentRows: KeyValueRow[] =
     activeEnvironment?.variables.map((variable) => ({ ...variable, secret: variable.secret })) ?? [];
 
+  const importCollectionFromFile = async (file: File) => {
+    const postmanJson = await file.text();
+    const res = await fetch(`${API_BASE}/collections/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ postmanJson }),
+    });
+
+    if (!res.ok) {
+      console.error(await res.text());
+      return;
+    }
+
+    const imported = (await res.json()) as Collection;
+    setCollections((prev) => [...prev, imported]);
+  };
+
+  const exportCollectionNode = async (collectionId: string, collectionName: string) => {
+    const res = await fetch(`${API_BASE}/collections/${collectionId}/export`);
+    if (!res.ok) {
+      console.error(await res.text());
+      return;
+    }
+
+    const payload = await res.json();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${collectionName.replace(/\s+/g, '-').toLowerCase() || 'collection'}.postman_collection.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <main style={styles.page}>
       <aside style={styles.sidebar}>
         <h3>Collections</h3>
         <button onClick={createCollection} style={styles.button} type="button">
           + Collection
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json"
+          style={{ display: 'none' }}
+          onChange={async (event) => {
+            const file = event.target.files?.[0];
+            if (file) {
+              await importCollectionFromFile(file);
+            }
+            event.target.value = '';
+          }}
+        />
+        <button type="button" style={styles.button} onClick={() => importInputRef.current?.click()}>
+          Import Collection
         </button>
         {collections.map((collection) => (
           <div key={collection.id}>
@@ -242,6 +293,13 @@ export default function HomePage() {
               </div>
             ))}
             {renderTree(collection.folders)}
+            <button
+              type="button"
+              style={styles.smallButton}
+              onClick={() => exportCollectionNode(collection.id, collection.name)}
+            >
+              Export Collection
+            </button>
             <button
               type="button"
               style={styles.smallButton}
