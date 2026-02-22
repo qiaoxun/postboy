@@ -23,12 +23,22 @@ export interface RequestDefinition {
 
 export interface ResponseSnapshot {
   status: number;
+  statusText?: string;
   headers: Record<string, string>;
   body: unknown;
+  bodyRaw?: string;
+  bodyPretty?: string;
+  isBinary?: boolean;
+  truncated?: boolean;
+  finalUrl?: string;
   timings: {
     startedAt: string;
     completedAt: string;
     durationMs: number;
+    dnsMs?: number;
+    connectMs?: number;
+    ttfbMs?: number;
+    totalMs?: number;
   };
 }
 
