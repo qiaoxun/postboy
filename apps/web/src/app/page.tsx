@@ -1,12 +1,16 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  BodyMode,
+  Collection,
+  CollectionFolder,
+  CollectionRequest,
+  Environment,
   HttpMethod,
   RequestDefinition,
-  ResponseSnapshot,
+  Variable,
 } from '@postboy/shared';
 
 type KeyValueRow = {
@@ -14,509 +18,361 @@ type KeyValueRow = {
   key: string;
   value: string;
   enabled: boolean;
+  secret?: boolean;
 };
-
-type AuthMode = 'none' | 'bearer' | 'basic' | 'api-key';
-type RequestEditorTab = 'params' | 'headers' | 'body' | 'auth' | 'tests';
-type ResponseTab = 'body' | 'headers';
-type ResponseBodyView = 'pretty' | 'raw' | 'preview';
-type RawEditorMode = 'json' | 'text';
 
 type RequestDraft = {
   id: string;
   name: string;
   request: RequestDefinition;
-  params: KeyValueRow[];
-  headers: KeyValueRow[];
-  auth: {
-    mode: AuthMode;
-    bearerToken: string;
-    basicUsername: string;
-    basicPassword: string;
-    apiKey: string;
-    apiKeyHeader: string;
-  };
-  rawEditorMode: RawEditorMode;
+  localVariables: KeyValueRow[];
 };
 
-type WorkspaceState = {
-  drafts: RequestDraft[];
-  activeDraftId: string;
-  activeEditorTab: RequestEditorTab;
-  activeResponseTab: ResponseTab;
-  activeResponseBodyView: ResponseBodyView;
-};
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
-const STORAGE_KEY = 'postboy:web:workspace-draft';
-
-const METHODS: HttpMethod[] = [
-  'GET',
-  'POST',
-  'PUT',
-  'PATCH',
-  'DELETE',
-  'HEAD',
-  'OPTIONS',
-];
-
-const BODY_MODES: Array<{ value: BodyMode | 'raw'; label: string }> = [
-  { value: 'none', label: 'None' },
-  { value: 'form-data', label: 'Form Data' },
-  { value: 'x-www-form-urlencoded', label: 'x-www-form-urlencoded' },
-  { value: 'raw', label: 'Raw' },
-];
-
-const defaultResponse: ResponseSnapshot = {
-  status: 200,
-  statusText: 'OK',
-  headers: {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-  },
-  body: { message: 'Ready to send request' },
-  bodyRaw: '{"message":"Ready to send request"}',
-  bodyPretty: JSON.stringify({ message: 'Ready to send request' }, null, 2),
-  finalUrl: 'https://api.example.com/status',
-  timings: {
-    startedAt: new Date().toISOString(),
-    completedAt: new Date().toISOString(),
-    durationMs: 42,
-    totalMs: 42,
-  },
-};
-
-function createRow(): KeyValueRow {
+function createDraft(): RequestDraft {
   return {
     id: crypto.randomUUID(),
-    key: '',
-    value: '',
-    enabled: true,
-  };
-}
-
-function createDraft(name: string): RequestDraft {
-  return {
-    id: crypto.randomUUID(),
-    name,
+    name: 'Request',
     request: {
       method: 'GET',
-      url: 'https://api.example.com',
+      url: 'https://api.example.com/{{version}}/users/{{id}}',
       headers: {},
       query: {},
-      body: {
-        mode: 'none',
-      },
+      body: { mode: 'none' },
     },
-    params: [createRow()],
-    headers: [createRow()],
-    auth: {
-      mode: 'none',
-      bearerToken: '',
-      basicUsername: '',
-      basicPassword: '',
-      apiKey: '',
-      apiKeyHeader: 'x-api-key',
-    },
-    rawEditorMode: 'json',
+    localVariables: [
+      { id: crypto.randomUUID(), key: 'id', value: '123', enabled: true },
+      { id: crypto.randomUUID(), key: 'token', value: 'local-token', enabled: true, secret: true },
+    ],
   };
 }
 
-function createInitialState(): WorkspaceState {
-  const firstDraft = createDraft('Request 1');
-  return {
-    drafts: [firstDraft],
-    activeDraftId: firstDraft.id,
-    activeEditorTab: 'params',
-    activeResponseTab: 'body',
-    activeResponseBodyView: 'pretty',
+function kvToVariables(rows: KeyValueRow[]): Variable[] {
+  return rows
+    .filter((row) => row.key.trim())
+    .map((row) => ({
+      id: row.id,
+      key: row.key,
+      value: row.value,
+      enabled: row.enabled,
+      secret: row.secret,
+    }));
+}
+
+function variableMap(variables: Variable[]): Record<string, string> {
+  return variables.reduce<Record<string, string>>((acc, variable) => {
+    if (variable.enabled) {
+      acc[variable.key] = variable.value;
+    }
+    return acc;
+  }, {});
+}
+
+function resolveWithPrecedence(input: string, local: Variable[], env: Variable[], globalVars: Variable[]) {
+  const merged = {
+    ...variableMap(globalVars),
+    ...variableMap(env),
+    ...variableMap(local),
   };
+  return input.replace(/{{\s*([\w.-]+)\s*}}/g, (full, key: string) => merged[key] ?? full);
+}
+
+function emptyFolder(name = 'Folder'): CollectionFolder {
+  return { id: crypto.randomUUID(), name, folders: [], requests: [] };
 }
 
 export default function HomePage() {
-  const [workspace, setWorkspace] = useState<WorkspaceState>(() => createInitialState());
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [environments, setEnvironments] = useState<Environment[]>([]);
+  const [globalVariables, setGlobalVariables] = useState<KeyValueRow[]>([
+    { id: crypto.randomUUID(), key: 'version', value: 'v1', enabled: true },
+    { id: crypto.randomUUID(), key: 'id', value: 'global-id', enabled: true },
+  ]);
+  const [activeEnvironmentId, setActiveEnvironmentId] = useState<string>('');
+  const [activeDraft, setActiveDraft] = useState<RequestDraft>(() => createDraft());
+  const [selectedCollectionId, setSelectedCollectionId] = useState<string>('');
+  const [selectedFolderId, setSelectedFolderId] = useState<string>('');
+
+  const activeEnvironment = environments.find((entry) => entry.id === activeEnvironmentId);
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-
-    try {
-      const parsed = JSON.parse(raw) as WorkspaceState;
-      if (parsed?.drafts?.length) {
-        setWorkspace(parsed);
+    const load = async () => {
+      const [collectionsRes, environmentsRes] = await Promise.all([
+        fetch(`${API_BASE}/collections`),
+        fetch(`${API_BASE}/environments`),
+      ]);
+      const loadedCollections = (await collectionsRes.json()) as Collection[];
+      const loadedEnvironments = (await environmentsRes.json()) as Environment[];
+      setCollections(loadedCollections);
+      setEnvironments(loadedEnvironments);
+      if (loadedCollections[0]) {
+        setSelectedCollectionId(loadedCollections[0].id);
       }
-    } catch {
-      localStorage.removeItem(STORAGE_KEY);
-    }
+      if (loadedEnvironments[0]) {
+        setActiveEnvironmentId(loadedEnvironments[0].id);
+      }
+    };
+
+    load().catch(console.error);
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
-  }, [workspace]);
-
-  const activeDraft =
-    workspace.drafts.find((draft) => draft.id === workspace.activeDraftId) ?? workspace.drafts[0];
-
-  const responseSize = useMemo(
-    () => new Blob([defaultResponse.bodyRaw ?? JSON.stringify(defaultResponse.body)]).size,
-    [],
+  const resolvedUrl = useMemo(
+    () =>
+      resolveWithPrecedence(
+        activeDraft.request.url,
+        kvToVariables(activeDraft.localVariables),
+        activeEnvironment?.variables ?? [],
+        kvToVariables(globalVariables),
+      ),
+    [activeDraft.request.url, activeDraft.localVariables, activeEnvironment?.variables, globalVariables],
   );
 
-  const updateDraft = (updater: (draft: RequestDraft) => RequestDraft) => {
-    setWorkspace((prev) => ({
-      ...prev,
-      drafts: prev.drafts.map((draft) => (draft.id === prev.activeDraftId ? updater(draft) : draft)),
-    }));
+  const saveCollections = async (nextCollections: Collection[]) => {
+    setCollections(nextCollections);
+    const selected = nextCollections.find((entry) => entry.id === selectedCollectionId);
+    if (!selected && nextCollections[0]) {
+      setSelectedCollectionId(nextCollections[0].id);
+    }
   };
 
-  const renderGrid = (
-    rows: KeyValueRow[],
-    onChange: (rows: KeyValueRow[]) => void,
-    withEnabled: boolean,
-  ) => (
-    <div>
-      {rows.map((row, index) => (
-        <div key={row.id} style={styles.gridRow}>
-          {withEnabled && (
-            <input
-              type="checkbox"
-              checked={row.enabled}
-              onChange={(event) => {
-                const nextRows = [...rows];
-                nextRows[index] = { ...row, enabled: event.target.checked };
-                onChange(nextRows);
-              }}
-            />
-          )}
-          <input
-            placeholder="Key"
-            value={row.key}
-            onChange={(event) => {
-              const nextRows = [...rows];
-              nextRows[index] = { ...row, key: event.target.value };
-              onChange(nextRows);
-            }}
-            style={styles.input}
-          />
-          <input
-            placeholder="Value"
-            value={row.value}
-            onChange={(event) => {
-              const nextRows = [...rows];
-              nextRows[index] = { ...row, value: event.target.value };
-              onChange(nextRows);
-            }}
-            style={styles.input}
-          />
-        </div>
-      ))}
-      <button
-        type="button"
-        onClick={() => onChange([...rows, createRow()])}
-        style={styles.secondaryButton}
-      >
-        Add row
-      </button>
-    </div>
-  );
+  const createCollection = async () => {
+    const res = await fetch(`${API_BASE}/collections`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: `Collection ${collections.length + 1}`, folders: [], requests: [] }),
+    });
+    const created = (await res.json()) as Collection;
+    await saveCollections([...collections, created]);
+    setSelectedCollectionId(created.id);
+  };
+
+  const saveRequestToCollection = async () => {
+    const collection = collections.find((entry) => entry.id === selectedCollectionId);
+    if (!collection) return;
+
+    const requestToSave: CollectionRequest = {
+      id: crypto.randomUUID(),
+      name: activeDraft.name,
+      definition: activeDraft.request,
+      variables: kvToVariables(activeDraft.localVariables),
+    };
+
+    const addToFolder = (folders: CollectionFolder[]): CollectionFolder[] =>
+      folders.map((folder) => {
+        if (folder.id === selectedFolderId) {
+          return { ...folder, requests: [...folder.requests, requestToSave] };
+        }
+
+        return { ...folder, folders: addToFolder(folder.folders) };
+      });
+
+    const next: Collection = selectedFolderId
+      ? { ...collection, folders: addToFolder(collection.folders), updatedAt: new Date().toISOString() }
+      : { ...collection, requests: [...collection.requests, requestToSave], updatedAt: new Date().toISOString() };
+
+    const res = await fetch(`${API_BASE}/collections/${collection.id}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(next),
+    });
+    const saved = (await res.json()) as Collection;
+    await saveCollections(collections.map((entry) => (entry.id === saved.id ? saved : entry)));
+  };
+
+  const renderTree = (folders: CollectionFolder[], depth = 0): ReactNode =>
+    folders.map((folder) => (
+      <div key={folder.id}>
+        <button
+          type="button"
+          style={{ ...styles.treeItem, marginLeft: depth * 12, ...(selectedFolderId === folder.id ? styles.activeTree : {}) }}
+          onClick={() => setSelectedFolderId(folder.id)}
+        >
+          📁 {folder.name}
+        </button>
+        {folder.requests.map((request) => (
+          <div key={request.id} style={{ ...styles.leaf, marginLeft: depth * 12 + 18 }}>
+            📄 {request.name}
+          </div>
+        ))}
+        {renderTree(folder.folders, depth + 1)}
+      </div>
+    ));
+
+  const updateEnvironmentVariable = (envId: string, rows: KeyValueRow[]) => {
+    const next = environments.map((env) =>
+      env.id === envId ? { ...env, variables: kvToVariables(rows), updatedAt: new Date().toISOString() } : env,
+    );
+    setEnvironments(next);
+    const env = next.find((entry) => entry.id === envId);
+    if (!env) return;
+    fetch(`${API_BASE}/environments/${envId}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(env),
+    }).catch(console.error);
+  };
+
+  const activeEnvironmentRows: KeyValueRow[] =
+    activeEnvironment?.variables.map((variable) => ({ ...variable, secret: variable.secret })) ?? [];
 
   return (
     <main style={styles.page}>
-      <h1 style={styles.title}>Postboy</h1>
-
-      <div style={styles.requestTabBar}>
-        {workspace.drafts.map((draft) => (
-          <button
-            key={draft.id}
-            type="button"
-            style={{
-              ...styles.requestTab,
-              ...(draft.id === activeDraft.id ? styles.requestTabActive : {}),
-            }}
-            onClick={() => setWorkspace((prev) => ({ ...prev, activeDraftId: draft.id }))}
-          >
-            {draft.name}
-          </button>
+      <aside style={styles.sidebar}>
+        <h3>Collections</h3>
+        <button onClick={createCollection} style={styles.button} type="button">
+          + Collection
+        </button>
+        {collections.map((collection) => (
+          <div key={collection.id}>
+            <button
+              type="button"
+              style={{ ...styles.treeItem, ...(collection.id === selectedCollectionId ? styles.activeTree : {}) }}
+              onClick={() => {
+                setSelectedCollectionId(collection.id);
+                setSelectedFolderId('');
+              }}
+            >
+              🗂 {collection.name}
+            </button>
+            {collection.requests.map((request) => (
+              <div key={request.id} style={styles.leaf}>
+                📄 {request.name}
+              </div>
+            ))}
+            {renderTree(collection.folders)}
+            <button
+              type="button"
+              style={styles.smallButton}
+              onClick={async () => {
+                const next = {
+                  ...collection,
+                  folders: [...collection.folders, emptyFolder(`Folder ${collection.folders.length + 1}`)],
+                };
+                const res = await fetch(`${API_BASE}/collections/${collection.id}`, {
+                  method: 'PUT',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify(next),
+                });
+                const saved = (await res.json()) as Collection;
+                setCollections((prev) => prev.map((entry) => (entry.id === saved.id ? saved : entry)));
+              }}
+            >
+              + Folder
+            </button>
+          </div>
         ))}
-        <button
-          type="button"
-          style={styles.secondaryButton}
-          onClick={() => {
-            const next = createDraft(`Request ${workspace.drafts.length + 1}`);
-            setWorkspace((prev) => ({
-              ...prev,
-              drafts: [...prev.drafts, next],
-              activeDraftId: next.id,
-            }));
-          }}
-        >
-          + New Request
-        </button>
-      </div>
+      </aside>
 
-      <div style={styles.topBar}>
-        <select
-          value={activeDraft.request.method}
-          onChange={(event) =>
-            updateDraft((draft) => ({
-              ...draft,
-              request: { ...draft.request, method: event.target.value as HttpMethod },
-            }))
-          }
-          style={styles.select}
-        >
-          {METHODS.map((method) => (
-            <option key={method} value={method}>
-              {method}
-            </option>
-          ))}
-        </select>
+      <section style={styles.main}>
+        <h1>Postboy</h1>
+        <div style={styles.row}>
+          <select
+            value={activeDraft.request.method}
+            onChange={(event) =>
+              setActiveDraft((prev) => ({
+                ...prev,
+                request: { ...prev.request, method: event.target.value as HttpMethod },
+              }))
+            }
+          >
+            {METHODS.map((method) => (
+              <option key={method}>{method}</option>
+            ))}
+          </select>
+          <input
+            value={activeDraft.request.url}
+            onChange={(event) =>
+              setActiveDraft((prev) => ({ ...prev, request: { ...prev.request, url: event.target.value } }))
+            }
+            style={styles.input}
+          />
+          <button type="button" onClick={saveRequestToCollection} style={styles.button}>
+            Save Request
+          </button>
+        </div>
+        <small>Resolved URL (local &gt; environment &gt; global): {resolvedUrl}</small>
 
-        <input
-          value={activeDraft.request.url}
-          onChange={(event) =>
-            updateDraft((draft) => ({
-              ...draft,
-              request: { ...draft.request, url: event.target.value },
-            }))
-          }
-          style={{ ...styles.input, flex: 1 }}
-        />
-
-        <button type="button" style={styles.primaryButton}>
-          Send
-        </button>
-      </div>
-
-      <section style={styles.card}>
-        <div style={styles.tabBar}>
-          {(['params', 'headers', 'body', 'auth', 'tests'] as RequestEditorTab[]).map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => setWorkspace((prev) => ({ ...prev, activeEditorTab: tab }))}
-              style={{ ...styles.tab, ...(workspace.activeEditorTab === tab ? styles.tabActive : {}) }}
-            >
-              {tab.toUpperCase()}
-            </button>
-          ))}
+        <h3>Environment</h3>
+        <div style={styles.row}>
+          <select value={activeEnvironmentId} onChange={(event) => setActiveEnvironmentId(event.target.value)}>
+            <option value="">No environment</option>
+            {environments.map((environment) => (
+              <option key={environment.id} value={environment.id}>
+                {environment.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            style={styles.button}
+            onClick={async () => {
+              const res = await fetch(`${API_BASE}/environments`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ name: `Environment ${environments.length + 1}`, variables: [] }),
+              });
+              const created = (await res.json()) as Environment;
+              setEnvironments((prev) => [...prev, created]);
+              setActiveEnvironmentId(created.id);
+            }}
+          >
+            + Environment
+          </button>
         </div>
 
-        {workspace.activeEditorTab === 'params' &&
-          renderGrid(activeDraft.params, (rows) => updateDraft((draft) => ({ ...draft, params: rows })), false)}
-
-        {workspace.activeEditorTab === 'headers' &&
-          renderGrid(
-            activeDraft.headers,
-            (rows) => updateDraft((draft) => ({ ...draft, headers: rows })),
-            true,
-          )}
-
-        {workspace.activeEditorTab === 'body' && (
+        <h3>Environment Variables</h3>
+        {activeEnvironment && (
           <div style={styles.stack}>
-            <select
-              value={activeDraft.request.body.mode}
-              onChange={(event) =>
-                updateDraft((draft) => ({
-                  ...draft,
-                  request: {
-                    ...draft.request,
-                    body: {
-                      ...draft.request.body,
-                      mode: event.target.value as BodyMode,
-                    },
-                  },
-                }))
-              }
-              style={styles.select}
-            >
-              {BODY_MODES.map((mode) => (
-                <option key={mode.value} value={mode.value}>
-                  {mode.label}
-                </option>
-              ))}
-            </select>
-
-            {activeDraft.request.body.mode === 'raw' && (
-              <>
-                <select
-                  value={activeDraft.rawEditorMode}
-                  onChange={(event) =>
-                    updateDraft((draft) => ({
-                      ...draft,
-                      rawEditorMode: event.target.value as RawEditorMode,
-                      request: {
-                        ...draft.request,
-                        body: {
-                          ...draft.request.body,
-                          contentType:
-                            event.target.value === 'json' ? 'application/json' : 'text/plain',
-                        },
-                      },
-                    }))
-                  }
-                  style={styles.select}
-                >
-                  <option value="json">Raw JSON</option>
-                  <option value="text">Raw Text</option>
-                </select>
-                <textarea placeholder="Request body" style={styles.textarea} />
-              </>
-            )}
-          </div>
-        )}
-
-        {workspace.activeEditorTab === 'auth' && (
-          <div style={styles.stack}>
-            <select
-              value={activeDraft.auth.mode}
-              onChange={(event) =>
-                updateDraft((draft) => ({
-                  ...draft,
-                  auth: { ...draft.auth, mode: event.target.value as AuthMode },
-                }))
-              }
-              style={styles.select}
-            >
-              <option value="none">None</option>
-              <option value="bearer">Bearer</option>
-              <option value="basic">Basic</option>
-              <option value="api-key">API Key</option>
-            </select>
-            {activeDraft.auth.mode === 'bearer' && (
-              <input
-                placeholder="Bearer token"
-                value={activeDraft.auth.bearerToken}
-                onChange={(event) =>
-                  updateDraft((draft) => ({
-                    ...draft,
-                    auth: { ...draft.auth, bearerToken: event.target.value },
-                  }))
-                }
-                style={styles.input}
-              />
-            )}
-            {activeDraft.auth.mode === 'basic' && (
-              <>
+            {activeEnvironmentRows.map((row, index) => (
+              <div style={styles.row} key={row.id}>
                 <input
-                  placeholder="Username"
-                  value={activeDraft.auth.basicUsername}
-                  onChange={(event) =>
-                    updateDraft((draft) => ({
-                      ...draft,
-                      auth: { ...draft.auth, basicUsername: event.target.value },
-                    }))
-                  }
-                  style={styles.input}
-                />
-                <input
-                  placeholder="Password"
-                  type="password"
-                  value={activeDraft.auth.basicPassword}
-                  onChange={(event) =>
-                    updateDraft((draft) => ({
-                      ...draft,
-                      auth: { ...draft.auth, basicPassword: event.target.value },
-                    }))
-                  }
-                  style={styles.input}
-                />
-              </>
-            )}
-            {activeDraft.auth.mode === 'api-key' && (
-              <>
-                <input
-                  placeholder="Header name"
-                  value={activeDraft.auth.apiKeyHeader}
-                  onChange={(event) =>
-                    updateDraft((draft) => ({
-                      ...draft,
-                      auth: { ...draft.auth, apiKeyHeader: event.target.value },
-                    }))
-                  }
-                  style={styles.input}
-                />
-                <input
-                  placeholder="API key"
-                  value={activeDraft.auth.apiKey}
-                  onChange={(event) =>
-                    updateDraft((draft) => ({
-                      ...draft,
-                      auth: { ...draft.auth, apiKey: event.target.value },
-                    }))
-                  }
-                  style={styles.input}
-                />
-              </>
-            )}
-          </div>
-        )}
-
-        {workspace.activeEditorTab === 'tests' && (
-          <fieldset disabled style={styles.stack}>
-            <textarea
-              style={styles.textarea}
-              placeholder="Tests are not implemented yet. Script editor will appear here."
-            />
-          </fieldset>
-        )}
-      </section>
-
-      <section style={styles.card}>
-        <div style={styles.responseMeta}>
-          <span style={styles.statusBadge}>{defaultResponse.status}</span>
-          <span>{defaultResponse.timings.durationMs} ms</span>
-          <span>{responseSize} B</span>
-        </div>
-
-        <div style={styles.tabBar}>
-          {(['body', 'headers'] as ResponseTab[]).map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => setWorkspace((prev) => ({ ...prev, activeResponseTab: tab }))}
-              style={{ ...styles.tab, ...(workspace.activeResponseTab === tab ? styles.tabActive : {}) }}
-            >
-              {tab.toUpperCase()}
-            </button>
-          ))}
-        </div>
-
-        {workspace.activeResponseTab === 'headers' && (
-          <pre style={styles.pre}>{JSON.stringify(defaultResponse.headers, null, 2)}</pre>
-        )}
-
-        {workspace.activeResponseTab === 'body' && (
-          <>
-            <div style={styles.tabBar}>
-              {(['pretty', 'raw', 'preview'] as ResponseBodyView[]).map((view) => (
-                <button
-                  key={view}
-                  type="button"
-                  onClick={() =>
-                    setWorkspace((prev) => ({
-                      ...prev,
-                      activeResponseBodyView: view,
-                    }))
-                  }
-                  style={{
-                    ...styles.tab,
-                    ...(workspace.activeResponseBodyView === view ? styles.tabActive : {}),
+                  value={row.key}
+                  onChange={(event) => {
+                    const next = [...activeEnvironmentRows];
+                    next[index] = { ...row, key: event.target.value };
+                    updateEnvironmentVariable(activeEnvironment.id, next);
                   }}
-                >
-                  {view.toUpperCase()}
-                </button>
-              ))}
-            </div>
-            {workspace.activeResponseBodyView === 'pretty' && (
-              <pre style={styles.pre}>{defaultResponse.bodyPretty}</pre>
-            )}
-            {workspace.activeResponseBodyView === 'raw' && (
-              <pre style={styles.pre}>{defaultResponse.bodyRaw}</pre>
-            )}
-            {workspace.activeResponseBodyView === 'preview' && (
-              <div style={styles.preview}>{String((defaultResponse.body as { message: string }).message)}</div>
-            )}
-          </>
+                  placeholder="Key"
+                />
+                <input
+                  type={row.secret ? 'password' : 'text'}
+                  value={row.value}
+                  onChange={(event) => {
+                    const next = [...activeEnvironmentRows];
+                    next[index] = { ...row, value: event.target.value };
+                    updateEnvironmentVariable(activeEnvironment.id, next);
+                  }}
+                  placeholder="Value"
+                />
+                <label>
+                  Secret
+                  <input
+                    type="checkbox"
+                    checked={Boolean(row.secret)}
+                    onChange={(event) => {
+                      const next = [...activeEnvironmentRows];
+                      next[index] = { ...row, secret: event.target.checked };
+                      updateEnvironmentVariable(activeEnvironment.id, next);
+                    }}
+                  />
+                </label>
+              </div>
+            ))}
+            <button
+              type="button"
+              style={styles.smallButton}
+              onClick={() =>
+                updateEnvironmentVariable(activeEnvironment.id, [
+                  ...activeEnvironmentRows,
+                  { id: crypto.randomUUID(), key: '', value: '', enabled: true, secret: false },
+                ])
+              }
+            >
+              + Variable
+            </button>
+          </div>
         )}
       </section>
     </main>
@@ -524,103 +380,15 @@ export default function HomePage() {
 }
 
 const styles: Record<string, CSSProperties> = {
-  page: {
-    padding: '1.5rem',
-    maxWidth: '1200px',
-    margin: '0 auto',
-    display: 'grid',
-    gap: '1rem',
-    fontFamily: 'Inter, Arial, sans-serif',
-  },
-  title: { margin: 0 },
-  requestTabBar: { display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' },
-  requestTab: {
-    border: '1px solid #d1d5db',
-    background: '#fff',
-    padding: '0.35rem 0.75rem',
-    borderRadius: 8,
-  },
-  requestTabActive: {
-    background: '#eef2ff',
-    borderColor: '#6366f1',
-  },
-  topBar: {
-    display: 'flex',
-    gap: '0.5rem',
-    alignItems: 'center',
-  },
-  card: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 12,
-    padding: '1rem',
-    display: 'grid',
-    gap: '0.75rem',
-    background: '#fff',
-  },
-  tabBar: { display: 'flex', gap: '0.5rem', flexWrap: 'wrap' },
-  tab: {
-    border: '1px solid #d1d5db',
-    borderRadius: 8,
-    background: '#fff',
-    padding: '0.35rem 0.7rem',
-    fontSize: '0.8rem',
-  },
-  tabActive: {
-    borderColor: '#0f766e',
-    background: '#f0fdfa',
-  },
-  gridRow: { display: 'grid', gridTemplateColumns: '24px 1fr 1fr', gap: '0.5rem', marginBottom: '0.5rem' },
-  input: {
-    border: '1px solid #d1d5db',
-    borderRadius: 8,
-    padding: '0.45rem 0.65rem',
-  },
-  textarea: {
-    minHeight: 120,
-    border: '1px solid #d1d5db',
-    borderRadius: 8,
-    padding: '0.65rem',
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  },
-  select: {
-    border: '1px solid #d1d5db',
-    borderRadius: 8,
-    padding: '0.45rem 0.65rem',
-  },
-  primaryButton: {
-    border: '1px solid #0f766e',
-    background: '#0f766e',
-    color: '#fff',
-    borderRadius: 8,
-    padding: '0.45rem 0.9rem',
-  },
-  secondaryButton: {
-    border: '1px solid #d1d5db',
-    background: '#fff',
-    borderRadius: 8,
-    padding: '0.4rem 0.8rem',
-  },
+  page: { display: 'grid', gridTemplateColumns: '280px 1fr', minHeight: '100vh', gap: '1rem', padding: '1rem' },
+  sidebar: { border: '1px solid #ddd', borderRadius: 8, padding: '0.75rem', display: 'grid', alignContent: 'start', gap: '0.5rem' },
+  main: { border: '1px solid #ddd', borderRadius: 8, padding: '1rem', display: 'grid', alignContent: 'start', gap: '0.75rem' },
+  row: { display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' },
   stack: { display: 'grid', gap: '0.5rem' },
-  responseMeta: { display: 'flex', gap: '0.75rem', alignItems: 'center' },
-  statusBadge: {
-    background: '#dcfce7',
-    color: '#15803d',
-    borderRadius: 999,
-    padding: '0.2rem 0.65rem',
-    fontWeight: 700,
-  },
-  pre: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    margin: 0,
-    padding: '0.75rem',
-    overflowX: 'auto',
-    background: '#f8fafc',
-  },
-  preview: {
-    border: '1px solid #e5e7eb',
-    borderRadius: 8,
-    padding: '1rem',
-    background: '#fff',
-  },
+  input: { flex: 1 },
+  button: { padding: '0.4rem 0.75rem' },
+  smallButton: { fontSize: '0.8rem', padding: '0.25rem 0.5rem' },
+  treeItem: { width: '100%', textAlign: 'left', padding: '0.35rem', background: '#fff', border: '1px solid #ddd', borderRadius: 6 },
+  activeTree: { background: '#ecfeff', borderColor: '#0891b2' },
+  leaf: { fontSize: '0.85rem', color: '#475569', padding: '0.2rem 0.35rem 0.2rem 1rem' },
 };

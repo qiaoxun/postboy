@@ -48,27 +48,37 @@ export interface Variable {
   value: string;
   enabled: boolean;
   secret?: boolean;
+  scope?: 'global' | 'environment' | 'local';
 }
 
 export interface Environment {
   id: string;
   name: string;
   variables: Variable[];
+  createdAt: string;
+  updatedAt: string;
 }
 
-export interface Folder {
+export interface CollectionRequest {
   id: string;
   name: string;
-  requestIds: string[];
+  definition: RequestDefinition;
+  variables?: Variable[];
+}
+
+export interface CollectionFolder {
+  id: string;
+  name: string;
+  folders: CollectionFolder[];
+  requests: CollectionRequest[];
 }
 
 export interface Collection {
   id: string;
   name: string;
   description?: string;
-  folders: Folder[];
-  requests: RequestDefinition[];
-  environments: Environment[];
+  folders: CollectionFolder[];
+  requests: CollectionRequest[];
   createdAt: string;
   updatedAt: string;
 }
